@@ -1,7 +1,26 @@
 from vuer import Vuer
 from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
 # DIMENSO ADDITION: free-floating panels for the wrist cameras (DIM-547).
-from vuer.schemas import Image as _DimensoImage
+# ImageBackground, not Image: Image serialises the array as RAW `rgb` (~920KB per
+# 640x480 frame, per panel, per tick), while ImageBackground compresses to `src`
+# and honours format/quality. Both keep `matrix`, so camera-relative placement is
+# unaffected by the choice -- bandwidth is the whole difference.
+# Image, NOT ImageBackground: three ImageBackgrounds in one scene killed the Vuer
+# child process outright (client alive, :8012 gone, leaked shared memory). Image
+# ships raw `rgb` rather than compressed `src`, which costs bandwidth -- that is a
+# trade to revisit, but a working client beats a smaller payload.
+# Image, NOT ImageBackground: a *Background* is singular by design -- three of them
+# put three payloads on the wire and the client keeps ONE, which is exactly what the
+# operator saw. Image is a real plane, but world-space, so its position is computed
+# from the LIVE head pose below to make it track the head anyway.
+# The SAME element as the main frame. ImageBackground.position is an OFFSET FROM
+# CAMERA, so all three panels ride the head together. Using `Image` (world-space)
+# for the wings is what left them standing still in the room.
+# ImageBackground for ALL THREE. Its `position` is an OFFSET FROM THE CAMERA, which is the
+# only mechanism in this client that makes a panel ride the head -- and all three moving
+# together is the thing that actually worked. `Image` was tried for the wings and is
+# world-space: the wings stopped following the head and ended up on the floor of the room.
+from vuer.schemas import ImageBackground as _DimensoImage
 from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
@@ -217,11 +236,14 @@ class TeleVuer:
     # placed these in the play-space and Meet reported exactly the consequence: "it does not
     # move with the head movement like the main frame does". Every value is env-tunable so the
     # geometry can be adjusted in the headset, which is the only place it can be judged.
-    DIMENSO_WRIST_OFFSET_X = float(os.environ.get("DIMENSO_WRIST_OFFSET_X", "0.95"))
-    DIMENSO_WRIST_OFFSET_Y = float(os.environ.get("DIMENSO_WRIST_OFFSET_Y", "-0.20"))
-    DIMENSO_WRIST_DISTANCE = float(os.environ.get("DIMENSO_WRIST_DISTANCE", "1.25"))
-    DIMENSO_WRIST_YAW_DEG = float(os.environ.get("DIMENSO_WRIST_YAW_DEG", "38.0"))
-    DIMENSO_WRIST_HEIGHT = float(os.environ.get("DIMENSO_WRIST_HEIGHT", "0.85"))
+    # Beyond the head plane's half-width (~0.67 at 1m) so the wings flank it rather
+    # than overlapping it.
+    DIMENSO_WRIST_OFFSET_X = float(os.environ.get("DIMENSO_WRIST_OFFSET_X", "0.62"))
+    # IN FRONT of the head plane (which sits at distanceToCamera=1). At 1.25 the panels
+    # were behind it and occluded -- the operator saw only the big frame.
+    DIMENSO_WRIST_DISTANCE = float(os.environ.get("DIMENSO_WRIST_DISTANCE", "0.95"))
+    DIMENSO_WRIST_YAW_DEG = float(os.environ.get("DIMENSO_WRIST_YAW_DEG", "20.0"))
+    DIMENSO_WRIST_HEIGHT = float(os.environ.get("DIMENSO_WRIST_HEIGHT", "0.62"))
     DIMENSO_WRIST_ASPECT = float(os.environ.get("DIMENSO_WRIST_ASPECT", "1.333"))
 
     def _dimenso_init_wrist_buffers(self):
@@ -235,11 +257,17 @@ class TeleVuer:
         self._dimenso_wrist = {}
         try:
             for side in self.DIMENSO_WRIST_SIDES:
+                # A quarter turn swaps the frame's dimensions. Sizing the buffer landscape
+                # and then resizing a portrait frame into it would squash the picture, so the
+                # buffer takes the ROTATED shape.
+                h, w, c = self.img_shape
+                shape = (w, h, c) if self.DIMENSO_WRIST_ROTATE % 180 == 90 else (h, w, c)
+                self._dimenso_wrist_shape = shape
                 shm = shared_memory.SharedMemory(
-                    create=True, size=int(np.prod(self.img_shape)) * np.uint8().itemsize)
+                    create=True, size=int(np.prod(shape)) * np.uint8().itemsize)
                 self._dimenso_wrist_shm[side] = shm
                 self._dimenso_wrist[side] = np.ndarray(
-                    self.img_shape, dtype=np.uint8, buffer=shm.buf)
+                    shape, dtype=np.uint8, buffer=shm.buf)
                 self._dimenso_wrist[side][:] = 0
         except Exception as e:
             print(f"[TeleVuer][dimenso] wrist panels unavailable ({e!r}); head view unaffected")
@@ -258,45 +286,118 @@ class TeleVuer:
         if buf is None or image is None:
             return
         try:
+            # Rotate FIRST, then fit. The wrist cameras are mounted turned relative to the
+            # operator's view, so the raw frame reads sideways -- rotating it is what makes the
+            # panel a POV of the hand rather than a picture lying on its side.
+            rot = self.DIMENSO_WRIST_ROTATE % 360
+            if rot == 90:
+                image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            elif rot == 270:
+                image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            elif rot == 180:
+                image = cv2.rotate(image, cv2.ROTATE_180)
             if image.shape != buf.shape:
                 image = cv2.resize(image, (buf.shape[1], buf.shape[0]))
             buf[:] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         except Exception:
             return
 
-    def _dimenso_wrist_matrix(self, side):
-        """A camera-relative 4x4 for one wrist panel: out to the side, angled inward.
+    # --- ScreenX layout (DIM-547) -------------------------------------------------------
+    # Centre frame is DIMENSO_MAIN_HEIGHT tall at distanceToCamera=1, so its half-width is
+    # (height * aspect) / 2. Each wing is the same height and is placed so its INNER EDGE
+    # meets that outer edge, then canted back by YAW -- the cinema layout, not two floating
+    # thumbnails.
+    DIMENSO_MAIN_HEIGHT = float(os.environ.get("DIMENSO_MAIN_HEIGHT", "0.80"))
+    DIMENSO_WRIST_YAW_DEG = float(os.environ.get("DIMENSO_WRIST_YAW_DEG", "50.0"))
+    DIMENSO_WRIST_HEIGHT = float(os.environ.get("DIMENSO_WRIST_HEIGHT", "0.80"))
+    DIMENSO_WRIST_DISTANCE = float(os.environ.get("DIMENSO_WRIST_DISTANCE", "1.0"))
+    # x offset: the seam knob. 0.77 left a visible gap at yaw 38.
+    DIMENSO_WRIST_OFFSET_X = float(os.environ.get("DIMENSO_WRIST_OFFSET_X", "0.62"))
+    # depth: the value that rendered. Larger pushes the wings behind the centre.
+    DIMENSO_WRIST_DEPTH = float(os.environ.get("DIMENSO_WRIST_DEPTH", "0.82"))
 
-        The shape Meet asked for is a ScreenX cinema: a main screen ahead with side screens
-        canted in at the edges of vision, all moving with the viewer. So each panel is pushed
-        out along X, set slightly low (the wrists are below eye line), and YAWED INWARD so it
-        faces the operator instead of presenting its edge.
+    def _dimenso_wing_matrix(self, side):
+        """Full TRS matrix for one wing, IN CAMERA SPACE, column-major.
 
-        Column-major, because three.js `Matrix4.fromArray` reads columns first. Camera space is
-        right-handed with -Z forward, so the forward offset is negative.
+        Read out of the client bundle rather than guessed:
+
+            useLayoutEffect(... if (!ref.current || !fixed) return; ...position/rotation... )
+            useFrame(... if (fixed) return;
+                         if (matrix) { m.fromArray(matrix).premultiply(camera.matrixWorld) }
+                         else camera.matrixWorld.decompose(mesh.position, ...) )
+
+        So with the default `fixed=false`, `position`/`rotation` are IGNORED and every panel is
+        placed exactly AT the camera -- which is why three panels looked like one. `matrix` is
+        the only offset the component honours, and it is premultiplied by the camera, so it is
+        camera-relative and rides the head.
+
+        SCALE IS BAKED IN and `height`/`aspect` are NOT passed: those set mesh.scale earlier in
+        the same useFrame, and `matrix.decompose()` then overwrites it. That collision is why
+        the first matrix attempt rendered nothing usable.
         """
         import math
-
         sign = -1.0 if side == "left" else 1.0
-        yaw = math.radians(self.DIMENSO_WRIST_YAW_DEG) * -sign   # inward, toward the viewer
-        c, s_ = math.cos(yaw), math.sin(yaw)
+        h = self.DIMENSO_WRIST_HEIGHT
+        w = h * (self._dimenso_wrist_shape[1] / self._dimenso_wrist_shape[0])
+        yaw = -sign * math.radians(self.DIMENSO_WRIST_YAW_DEG)
+        c, sn = math.cos(yaw), math.sin(yaw)
+        x = sign * self.DIMENSO_WRIST_OFFSET_X
+        z = -self.DIMENSO_WRIST_DEPTH
+        # column-major: [ Rx*w | Ry*h | Rz | T ]
+        return [ c * w, 0.0, -sn * w, 0.0,
+                   0.0,   h,     0.0, 0.0,
+                    sn, 0.0,       c, 0.0,
+                     x, 0.0,       z, 1.0]
+
+    def _dimenso_wrist_matrix(self, side):
+        """Column-major 4x4 placing one wing IN THE CAMERA'S OWN FRAME.
+
+        The component does `mesh.matrix.fromArray(matrix).premultiply(camera.matrixWorld)`, so a
+        matrix expressed in camera space rides with the head for free. World-space
+        position/rotation driven by `head_pose_shared` was tried first and sat still, because
+        that pose is only published by CAMERA_MOVE and does not arrive in this mode.
+        """
+        import math
+        sign = -1.0 if side == "left" else 1.0
+        yaw = -sign * math.radians(self.DIMENSO_WRIST_YAW_DEG)
+        c, sn = math.cos(yaw), math.sin(yaw)
         x = sign * self.DIMENSO_WRIST_OFFSET_X
         y = self.DIMENSO_WRIST_OFFSET_Y
         z = -self.DIMENSO_WRIST_DISTANCE
-        return [
-            c,   0.0, -s_, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            s_,  0.0, c,   0.0,
-            x,   y,   z,   1.0,
-        ]
+        return [  c, 0.0, -sn, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                 sn, 0.0,   c, 0.0,
+                  x,   y,   z, 1.0]
 
-    def _dimenso_wrist_panels(self):
-        """The scene elements for the wrist views, or [] when they are unavailable."""
+    # The wrist cameras are mounted rotated relative to the operator's view, so the raw frame
+    # reads sideways. 90 = clockwise, -90 = counter-clockwise, 180, or 0 to leave it alone.
+    DIMENSO_WRIST_ROTATE = int(os.environ.get("DIMENSO_WRIST_ROTATE", "270"))
+    DIMENSO_WRIST_PERIOD_S = float(os.environ.get("DIMENSO_WRIST_PERIOD_S", "0.2"))
+    _dimenso_wrist_next = {}
+
+    def _dimenso_wrist_panels(self, session):
+        """The scene elements for the wrist views, or [] when they are unavailable.
+
+        Emitted every Nth call, NOT every frame. The head view runs at display_fps; adding two
+        more images at that rate is what killed the vuer child twice on a live session."""
+        # PER SESSION, and time-based. The first version used a class-level tick counter and
+        # a modulo, so with more than one session connected (headset + a probe, or two tabs)
+        # the wings went only to whichever loop happened to hit the multiple -- the other
+        # session never received them at all. That is why the panel count changed on reload.
+        # A new session ALWAYS gets them immediately, then they refresh on a wall clock.
+        import time as _t
+        key = id(session)
+        now = _t.monotonic()
+        due = self._dimenso_wrist_next.get(key)
+        if due is not None and now < due:
+            return []
+        self._dimenso_wrist_next[key] = now + self.DIMENSO_WRIST_PERIOD_S
         out = []
         for side in self.DIMENSO_WRIST_SIDES:
             buf = getattr(self, "_dimenso_wrist", {}).get(side)
             if buf is None:
                 continue
+            _dimenso_place = self._dimenso_wing_matrix(side)
             out.append(_DimensoImage(
                 buf,
                 key=f"dimenso-wrist-{side}",
@@ -309,9 +410,11 @@ class TeleVuer:
                 # component: it does `mesh.matrix.fromArray(matrix)` then
                 # `.premultiply(camera.matrixWorld)`, so the transform is interpreted in the
                 # camera's own frame and the panel rides with the head like the main view.
-                matrix=self._dimenso_wrist_matrix(side),
-                aspect=self.DIMENSO_WRIST_ASPECT,
-                height=self.DIMENSO_WRIST_HEIGHT,
+                # matrix ONLY. `position`/`rotation` are ignored unless `fixed` is true (the
+                # component's own useLayoutEffect bails on `!fixed`), and `height`/`aspect`
+                # set mesh.scale which `matrix.decompose()` then overwrites. Scale is baked
+                # into the matrix instead.
+                matrix=_dimenso_place,
                 format="jpeg",
                 quality=70,          # secondary views; the head stream keeps the bandwidth
                 interpolate=True,
@@ -475,7 +578,7 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display[:, :self.img_width],
                         aspect=self.aspect_ratio,
-                        height=1,
+                        height=self.DIMENSO_MAIN_HEIGHT,
                         distanceToCamera=1,
                         # The underlying rendering engine supported a layer binary bitmask for both objects and the camera. 
                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
@@ -489,7 +592,7 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display[:, self.img_width:],
                         aspect=self.aspect_ratio,
-                        height=1,
+                        height=self.DIMENSO_MAIN_HEIGHT,
                         distanceToCamera=1,
                         layers=2,
                         format="jpeg",
@@ -531,7 +634,7 @@ class TeleVuer:
                     ImageBackground(
                         self.img2display,
                         aspect=self.aspect_ratio,
-                        height=1,
+                        height=self.DIMENSO_MAIN_HEIGHT,
                         distanceToCamera=1,
                         format="jpeg",
                         quality=80,
@@ -541,7 +644,7 @@ class TeleVuer:
                     # DIMENSO ADDITION (DIM-547): the wrist panels ride the SAME upsert as
                     # the head view. Sent together so a slow panel can never delay the main
                     # view, and so the two can never drift into different frames.
-                    *self._dimenso_wrist_panels(),
+                    *self._dimenso_wrist_panels(session),
                 ],
                 to="bgChildren",
             )
