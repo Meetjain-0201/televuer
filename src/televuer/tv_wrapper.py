@@ -455,6 +455,13 @@ class TeleVuerWrapper:
         
     def render_to_xr(self, img):
         self.tvuer.render_to_xr(img)
+
+    # DIMENSO ADDITION (DIM-547): wrist camera panels. Thin passthrough, matching
+    # render_to_xr -- the wrapper's job is delegation, and putting the logic here instead
+    # would split the display code across two files for no gain.
+    def render_wrist_to_xr(self, side, img):
+        self.tvuer.render_wrist_to_xr(side, img)
+    # END DIMENSO ADDITION
     
     def close(self):
         self.tvuer.close()

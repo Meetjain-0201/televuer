@@ -1,5 +1,7 @@
 from vuer import Vuer
 from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+# DIMENSO ADDITION: free-floating panels for the wrist cameras (DIM-547).
+from vuer.schemas import Image as _DimensoImage
 from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
@@ -111,6 +113,12 @@ class TeleVuer:
                 self.stop_writer_event = threading.Event()
                 self.writer_thread = threading.Thread(target=self._xr_render_loop, daemon=True)
                 self.writer_thread.start()
+                # ---- DIMENSO ADDITION (DIM-547): wrist camera panels ------------------
+                # Shared memory, exactly like the head buffer above, and for the same
+                # reason: Vuer runs in a CHILD PROCESS, so a plain attribute written by the
+                # parent would never be seen by the upsert loop.
+                self._dimenso_init_wrist_buffers()
+                # ---- END DIMENSO ADDITION --------------------------------------------
                 fn = self.main_image_binocular_zmq if self.binocular else self.main_image_monocular_zmq
             else:
                 raise ValueError("[TeleVuer] immersive mode requires zmq=True or webrtc=True.")
@@ -187,6 +195,129 @@ class TeleVuer:
         finally:
             if hasattr(self, "stop_writer_event"):
                 self.stop_writer_event.set()
+
+    # ------------------------------------------------------------------ DIMENSO ADDITION
+    # DIM-547: wrist camera views as FREE-FLOATING panels in the XR scene.
+    #
+    # Meet: "add wrist cameras, in the frame as well, so i can overcome occlusion" -- when the
+    # hand is over an object the head camera cannot see the contact point. He chose floating
+    # panels over insets burned into the head image, so each view can be placed in the room
+    # and looked away from: "left wrist in left and right in right".
+    #
+    # Why this needs a fork at all: televuer draws exactly ONE stream. All eight of its
+    # main_image_* paths upsert a single ImageBackground, and upstream issue #219 shows the
+    # consequence -- a misconfigured head camera makes the UI fall back to a WRIST view
+    # instead of the head view, never both. Simultaneous views are not a config flag.
+    #
+    # teleimager already receives the streams (get_left_wrist_frame / get_right_wrist_frame),
+    # so nothing there changes; only the drawing does.
+    DIMENSO_WRIST_SIDES = ("left", "right")
+    # ScreenX-style side screens: a main view ahead with the wrist views canted in at the
+    # edges of vision, ALL MOVING WITH THE HEAD. Metres, in CAMERA space -- the first version
+    # placed these in the play-space and Meet reported exactly the consequence: "it does not
+    # move with the head movement like the main frame does". Every value is env-tunable so the
+    # geometry can be adjusted in the headset, which is the only place it can be judged.
+    DIMENSO_WRIST_OFFSET_X = float(os.environ.get("DIMENSO_WRIST_OFFSET_X", "0.95"))
+    DIMENSO_WRIST_OFFSET_Y = float(os.environ.get("DIMENSO_WRIST_OFFSET_Y", "-0.20"))
+    DIMENSO_WRIST_DISTANCE = float(os.environ.get("DIMENSO_WRIST_DISTANCE", "1.25"))
+    DIMENSO_WRIST_YAW_DEG = float(os.environ.get("DIMENSO_WRIST_YAW_DEG", "38.0"))
+    DIMENSO_WRIST_HEIGHT = float(os.environ.get("DIMENSO_WRIST_HEIGHT", "0.85"))
+    DIMENSO_WRIST_ASPECT = float(os.environ.get("DIMENSO_WRIST_ASPECT", "1.333"))
+
+    def _dimenso_init_wrist_buffers(self):
+        """One shared-memory RGB buffer per wrist, sized like the head frame.
+
+        Never fatal: if the buffers cannot be created the head view must still work. A
+        teleoperator losing the main view because a secondary panel failed to allocate would
+        be a strictly worse trade than not having the panels.
+        """
+        self._dimenso_wrist_shm = {}
+        self._dimenso_wrist = {}
+        try:
+            for side in self.DIMENSO_WRIST_SIDES:
+                shm = shared_memory.SharedMemory(
+                    create=True, size=int(np.prod(self.img_shape)) * np.uint8().itemsize)
+                self._dimenso_wrist_shm[side] = shm
+                self._dimenso_wrist[side] = np.ndarray(
+                    self.img_shape, dtype=np.uint8, buffer=shm.buf)
+                self._dimenso_wrist[side][:] = 0
+        except Exception as e:
+            print(f"[TeleVuer][dimenso] wrist panels unavailable ({e!r}); head view unaffected")
+            self._dimenso_wrist = {}
+
+    def render_wrist_to_xr(self, side, image):
+        """Publish one wrist frame. `side` is 'left' or 'right'.
+
+        Converted and copied inline rather than through a writer thread: these are secondary
+        views at a fraction of the head camera's importance, and an extra thread per wrist
+        would add two more places for the display to stall. A missing or wrong-shaped frame
+        is DROPPED, never partially written -- a torn frame in the corner of the eye is worse
+        than a stale one.
+        """
+        buf = getattr(self, "_dimenso_wrist", {}).get(side)
+        if buf is None or image is None:
+            return
+        try:
+            if image.shape != buf.shape:
+                image = cv2.resize(image, (buf.shape[1], buf.shape[0]))
+            buf[:] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        except Exception:
+            return
+
+    def _dimenso_wrist_matrix(self, side):
+        """A camera-relative 4x4 for one wrist panel: out to the side, angled inward.
+
+        The shape Meet asked for is a ScreenX cinema: a main screen ahead with side screens
+        canted in at the edges of vision, all moving with the viewer. So each panel is pushed
+        out along X, set slightly low (the wrists are below eye line), and YAWED INWARD so it
+        faces the operator instead of presenting its edge.
+
+        Column-major, because three.js `Matrix4.fromArray` reads columns first. Camera space is
+        right-handed with -Z forward, so the forward offset is negative.
+        """
+        import math
+
+        sign = -1.0 if side == "left" else 1.0
+        yaw = math.radians(self.DIMENSO_WRIST_YAW_DEG) * -sign   # inward, toward the viewer
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        x = sign * self.DIMENSO_WRIST_OFFSET_X
+        y = self.DIMENSO_WRIST_OFFSET_Y
+        z = -self.DIMENSO_WRIST_DISTANCE
+        return [
+            c,   0.0, -s_, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            s_,  0.0, c,   0.0,
+            x,   y,   z,   1.0,
+        ]
+
+    def _dimenso_wrist_panels(self):
+        """The scene elements for the wrist views, or [] when they are unavailable."""
+        out = []
+        for side in self.DIMENSO_WRIST_SIDES:
+            buf = getattr(self, "_dimenso_wrist", {}).get(side)
+            if buf is None:
+                continue
+            out.append(_DimensoImage(
+                buf,
+                key=f"dimenso-wrist-{side}",
+                # CAMERA-RELATIVE, not world-placed. `position=`/`rotation=` put the panel at a
+                # fixed spot in the ROOM, so it slides out of view the moment the operator turns
+                # their head -- which is exactly what Meet saw: "it does not move with the head
+                # movement like the main frame does".
+                #
+                # A `matrix` WITHOUT `fixed` is the camera-relative path in vuer's plane
+                # component: it does `mesh.matrix.fromArray(matrix)` then
+                # `.premultiply(camera.matrixWorld)`, so the transform is interpreted in the
+                # camera's own frame and the panel rides with the head like the main view.
+                matrix=self._dimenso_wrist_matrix(side),
+                aspect=self.DIMENSO_WRIST_ASPECT,
+                height=self.DIMENSO_WRIST_HEIGHT,
+                format="jpeg",
+                quality=70,          # secondary views; the head stream keeps the bandwidth
+                interpolate=True,
+            ))
+        return out
+    # ---------------------------------------------------------------- END DIMENSO ADDITION
 
     def _xr_render_loop(self):
         while not self.stop_writer_event.is_set():
@@ -407,6 +538,10 @@ class TeleVuer:
                         key="background-mono",
                         interpolate=True,
                     ),
+                    # DIMENSO ADDITION (DIM-547): the wrist panels ride the SAME upsert as
+                    # the head view. Sent together so a slow panel can never delay the main
+                    # view, and so the two can never drift into different frames.
+                    *self._dimenso_wrist_panels(),
                 ],
                 to="bgChildren",
             )
