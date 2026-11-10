@@ -1,3 +1,4 @@
+import time
 import numpy as np
 from .televuer import TeleVuer
 from dataclasses import dataclass, field
@@ -194,6 +195,10 @@ class TeleData:
     right_hand_squeeze: bool = False       # True if hand is making a fist
     right_hand_squeezeValue: float = 0.0   # (0.0 → 1.0) degree of hand squeeze
 
+    left_controller_world_pose: np.ndarray = None
+    right_controller_world_pose: np.ndarray = None
+    controller_poses_valid: bool = False
+    head_source_age_seconds: float = float("inf")
     controller_diagnostics: dict = None  # DIMENSO ADDITION (DIM-914): receiver event provenance
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
     # controller tracking
@@ -417,8 +422,17 @@ class TeleVuerWrapper:
         # controller tracking
         else:
             # Controller pose data directly follows the (initial pose) Unitree Humanoid Arm URDF Convention (thus no transform is needed).
-            left_IPunitree_Bxr_world_arm, left_arm_is_valid  = safe_mat_update(CONST_LEFT_ARM_POSE, self.tvuer.left_arm_pose)
-            right_IPunitree_Bxr_world_arm, right_arm_is_valid = safe_mat_update(CONST_RIGHT_ARM_POSE, self.tvuer.right_arm_pose)
+            with self.tvuer.controller_diagnostics.lock:
+                Bxr_world_head, head_pose_is_valid = safe_mat_update(CONST_HEAD_POSE, self.tvuer.head_pose)
+                left_IPunitree_Bxr_world_arm, left_arm_is_valid = safe_mat_update(CONST_LEFT_ARM_POSE, self.tvuer.left_arm_pose)
+                right_IPunitree_Bxr_world_arm, right_arm_is_valid = safe_mat_update(CONST_RIGHT_ARM_POSE, self.tvuer.right_arm_pose)
+                controller_diagnostics = self.tvuer.controller_diagnostics.snapshot()
+                received = self.tvuer.head_received_monotonic.value
+                head_age = max(0.0, time.monotonic() - received) if received else float("inf")
+                controller_values = {name: getattr(self.tvuer, name) for name in (
+                    "left_ctrl_triggerValue", "left_ctrl_squeezeValue",
+                    "right_ctrl_triggerValue", "right_ctrl_squeezeValue")}
+
 
             # Change basis convention
             Brobot_world_head = T_ROBOT_OPENXR @ Bxr_world_head @ T_OPENXR_ROBOT
@@ -431,17 +445,14 @@ class TeleVuerWrapper:
             # "head_yaw" additionally left-multiplies R_Brobot_world_head_yaw^T, ignoring pitch/roll.
             left_IPunitree_Brobot_waist_arm = transform_IPunitree_Brobot_world_arm_to_head_then_waist(left_IPunitree_Brobot_world_arm, Brobot_world_head, self.arm_reference_mode)
             right_IPunitree_Brobot_waist_arm = transform_IPunitree_Brobot_world_arm_to_head_then_waist(right_IPunitree_Brobot_world_arm, Brobot_world_head, self.arm_reference_mode)
-            # DIMENSO ADDITION (DIM-914): sample the four existing control inputs
-            # with their event receipt atomically; retain the original mapping.
-            with self.tvuer.controller_diagnostics.lock:
-                controller_diagnostics = self.tvuer.controller_diagnostics.snapshot()
-                controller_values = {name: getattr(self.tvuer, name) for name in (
-                    "left_ctrl_triggerValue", "left_ctrl_squeezeValue",
-                    "right_ctrl_triggerValue", "right_ctrl_squeezeValue")}
             return TeleData(
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_waist_arm,
                 right_wrist_pose=right_IPunitree_Brobot_waist_arm,
+                left_controller_world_pose=left_IPunitree_Brobot_world_arm,
+                right_controller_world_pose=right_IPunitree_Brobot_world_arm,
+                controller_poses_valid=bool(left_arm_is_valid and right_arm_is_valid and head_pose_is_valid),
+                head_source_age_seconds=head_age,
                 controller_diagnostics=controller_diagnostics,
                 motion_data_ready=self.tvuer.motion_data_ready,
                 left_ctrl_trigger=self.tvuer.left_ctrl_trigger,

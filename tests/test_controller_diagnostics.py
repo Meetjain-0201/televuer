@@ -57,6 +57,15 @@ def test_actual_callback_and_wrapper_mapping_share_one_receipt():
     returned=next(node for node in ast.walk(wrapper) if isinstance(node,ast.Return) and isinstance(node.value,ast.Call) and any(kw.arg=='controller_diagnostics' for kw in node.value.keywords))
     function=ast.parse('def sample(self):\n pass').body[0];function.body=[atomic,returned]
     context={'TeleData':lambda **kw:SimpleNamespace(**kw),'Brobot_world_head':None,'left_IPunitree_Brobot_waist_arm':None,'right_IPunitree_Brobot_waist_arm':None}
+    import numpy as np
+    import time
+    tv.head_pose=tv.left_arm_pose=tv.right_arm_pose=np.eye(4)
+    tv.head_received_monotonic=Value('d',time.monotonic())
+    context.update({'np':np,'time':time,'CONST_HEAD_POSE':np.eye(4),'CONST_LEFT_ARM_POSE':np.eye(4),
+                    'CONST_RIGHT_ARM_POSE':np.eye(4),'left_IPunitree_Brobot_world_arm':None,
+                    'right_IPunitree_Brobot_world_arm':None})
+    safe=next(node for node in wrapper.body if isinstance(node,ast.FunctionDef) and node.name=='safe_mat_update')
+    exec(compile(ast.Module(body=[safe],type_ignores=[]),'safe','exec'),context)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),'wrapper','exec'),context)
     data=context['sample'](SimpleNamespace(tvuer=tv))
     assert data.left_ctrl_triggerValue==7.5 and data.right_ctrl_triggerValue==2.5

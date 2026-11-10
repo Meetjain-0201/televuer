@@ -1,5 +1,5 @@
 from vuer import Vuer
-from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+from vuer.schemas import PerspectiveCamera, ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
 # DIMENSO ADDITION: free-floating panels for the wrist cameras (DIM-547).
 # ImageBackground, not Image: Image serialises the array as RAW `rgb` (~920KB per
 # 640x480 frame, per panel, per tick), while ImageBackground compresses to `src`
@@ -27,6 +27,7 @@ from .controller_diagnostics import ControllerDiagnostics
 import numpy as np
 import asyncio
 import threading
+import time
 import cv2
 import os
 from pathlib import Path
@@ -163,9 +164,12 @@ class TeleVuer:
         else:
             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
         
-        self.vuer.spawn(start=False)(fn)
+        async def session_handler(session):
+            await self._run_session(session, fn)
+        self.vuer.spawn(start=False)(session_handler)
 
         self.head_pose_shared = Array('d', 16, lock=True)
+        self.head_received_monotonic = Value('d', 0.0, lock=True)
         self.left_arm_pose_shared = Array('d', 16, lock=True)
         self.right_arm_pose_shared = Array('d', 16, lock=True)
         self.motion_data_ready_shared = Value('b', False, lock=True)
@@ -207,6 +211,12 @@ class TeleVuer:
         self.process.daemon = True
         self.process.start()
     
+    async def _run_session(self, session, handler):
+        """Disable auxiliary editor previews that unbind the immersive framebuffer (#646)."""
+        session.update @ PerspectiveCamera(
+            key="perspective-camera", previewInScene=False, previewInOverlay=False)
+        await handler(session)
+
     def _vuer_run(self):
         try:
             self.vuer.run()
@@ -491,11 +501,13 @@ class TeleVuer:
                 pass
 
     async def on_cam_move(self, event, session, fps=60):
-        try:
-            with self.head_pose_shared.get_lock():
-                self.head_pose_shared[:] = event.value["camera"]["matrix"]
-        except:
-            pass
+        with self.controller_diagnostics.lock:
+            try:
+                with self.head_pose_shared.get_lock():
+                    self.head_pose_shared[:] = event.value["camera"]["matrix"]
+                self.head_received_monotonic.value = time.monotonic()
+            except (KeyError, TypeError, ValueError):
+                self.head_received_monotonic.value = 0.0
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
