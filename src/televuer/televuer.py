@@ -22,6 +22,8 @@ from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoP
 # world-space: the wings stopped following the head and ended up on the floor of the room.
 from vuer.schemas import ImageBackground as _DimensoImage
 from multiprocessing import Value, Array, Process, shared_memory
+# DIMENSO ADDITION (DIM-914): controller-only event provenance.
+from .controller_diagnostics import ControllerDiagnostics
 import numpy as np
 import asyncio
 import threading
@@ -110,6 +112,7 @@ class TeleVuer:
                     key_file = key_file or str(current_module_dir / "key.pem")
 
         self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        self.controller_diagnostics = ControllerDiagnostics()
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -236,15 +239,17 @@ class TeleVuer:
     # placed these in the play-space and Meet reported exactly the consequence: "it does not
     # move with the head movement like the main frame does". Every value is env-tunable so the
     # geometry can be adjusted in the headset, which is the only place it can be judged.
-    # Beyond the head plane's half-width (~0.67 at 1m) so the wings flank it rather
-    # than overlapping it.
-    DIMENSO_WRIST_OFFSET_X = float(os.environ.get("DIMENSO_WRIST_OFFSET_X", "0.62"))
-    # IN FRONT of the head plane (which sits at distanceToCamera=1). At 1.25 the panels
-    # were behind it and occluded -- the operator saw only the big frame.
-    DIMENSO_WRIST_DISTANCE = float(os.environ.get("DIMENSO_WRIST_DISTANCE", "0.95"))
-    DIMENSO_WRIST_YAW_DEG = float(os.environ.get("DIMENSO_WRIST_YAW_DEG", "20.0"))
-    DIMENSO_WRIST_HEIGHT = float(os.environ.get("DIMENSO_WRIST_HEIGHT", "0.62"))
-    DIMENSO_WRIST_ASPECT = float(os.environ.get("DIMENSO_WRIST_ASPECT", "1.333"))
+    #
+    # THE GEOMETRY KNOBS ARE DECLARED ONCE, in the block above `_dimenso_wing_matrix`.
+    #
+    # They used to be declared TWICE in this class body -- here AND there -- and in a class
+    # body the LATER assignment silently wins. So this block was dead: it read
+    # DIMENSO_WRIST_YAW_DEG 20.0 while the effective value was 50.0, and HEIGHT 0.62 while
+    # the effective value was 0.80. Editing a value here changed nothing, with no error and
+    # nothing in any log -- and these are precisely the values Meet tunes from inside the
+    # headset, where a silent no-op costs a whole test cycle. Two of them (WRIST_DISTANCE,
+    # WRIST_ASPECT) were read by nothing at all once `_dimenso_wing_matrix` superseded the
+    # earlier placement, so they are gone rather than left looking load-bearing.
 
     def _dimenso_init_wrist_buffers(self):
         """One shared-memory RGB buffer per wrist, sized like the head frame.
@@ -303,18 +308,55 @@ class TeleVuer:
             return
 
     # --- ScreenX layout (DIM-547) -------------------------------------------------------
-    # Centre frame is DIMENSO_MAIN_HEIGHT tall at distanceToCamera=1, so its half-width is
+    # Centre frame is DIMENSO_MAIN_HEIGHT tall at DIMENSO_MAIN_DISTANCE, so its half-width is
     # (height * aspect) / 2. Each wing is the same height and is placed so its INNER EDGE
     # meets that outer edge, then canted back by YAW -- the cinema layout, not two floating
     # thumbnails.
     DIMENSO_MAIN_HEIGHT = float(os.environ.get("DIMENSO_MAIN_HEIGHT", "0.80"))
     DIMENSO_WRIST_YAW_DEG = float(os.environ.get("DIMENSO_WRIST_YAW_DEG", "50.0"))
     DIMENSO_WRIST_HEIGHT = float(os.environ.get("DIMENSO_WRIST_HEIGHT", "0.80"))
-    DIMENSO_WRIST_DISTANCE = float(os.environ.get("DIMENSO_WRIST_DISTANCE", "1.0"))
     # x offset: the seam knob. 0.77 left a visible gap at yaw 38.
     DIMENSO_WRIST_OFFSET_X = float(os.environ.get("DIMENSO_WRIST_OFFSET_X", "0.62"))
     # depth: the value that rendered. Larger pushes the wings behind the centre.
     DIMENSO_WRIST_DEPTH = float(os.environ.get("DIMENSO_WRIST_DEPTH", "0.82"))
+    # The centre frame's distance. Was the literal `distanceToCamera=1` at each of its call
+    # sites; named so ONE knob can move the whole rig.
+    DIMENSO_MAIN_DISTANCE = float(os.environ.get("DIMENSO_MAIN_DISTANCE", "1.0"))
+
+    # ---- 2026-08-11: zoom the whole three-frame layout out ---------------------------------
+    # Meet, from inside the headset: "zoom out the whole 3 frame layout a bit, when i wear the
+    # head set its a bit close, zoom out a bit so i can see wrist cameras as well".
+    #
+    # This multiplies the two DISTANCES ONLY (centre frame + wings) and deliberately leaves
+    # the heights and the lateral offset alone. That is what "zoom out" means here, and the
+    # arithmetic is the reason -- it is easy to get backwards:
+    #
+    #   angular size   of a panel = 2*atan((h/2) / d)      -> shrinks as d grows
+    #   angular OFFSET of a wing  =   atan( x    / d)      -> shrinks as d grows
+    #
+    # so raising d alone pulls the wings in toward the centre AND makes every panel smaller,
+    # which is the whole request. Scaling x and h by the same factor as d would cancel both
+    # terms exactly and change nothing visible -- a uniform scale of a camera-relative rig is
+    # angle-preserving. (That was the first thing tried on paper; it is why this knob touches
+    # distance and nothing else.)
+    #
+    # Measured from the committed geometry, aspect 4:3, wrist frames rotated 270:
+    #                       scale 1.0            scale 1.30
+    #   centre half-height   21.8 deg             17.1 deg
+    #   wing centre offset   37.1 deg             30.2 deg
+    #   layout half-width   ~50    deg           ~41    deg   (Quest 3 is ~110 deg total)
+    #
+    # At 1.0 the outer edges sat within a few degrees of the panel's own FOV limit, which is
+    # exactly what "a bit close" describes. Tunable without touching code and without a SIM
+    # relaunch -- only the teleop client restarts -- because judging it needs the headset.
+    DIMENSO_VIEW_SCALE = float(os.environ.get("DIMENSO_VIEW_SCALE", "1.30"))
+
+    @property
+    def _dimenso_main_distance(self):
+        """Centre-frame distance, zoom applied. A property, not a class constant computed at
+        import: the two are identical today, but a constant here would silently ignore any
+        future runtime change to the scale, which is the `DIMENSO_DIAG` trap in this repo."""
+        return self.DIMENSO_MAIN_DISTANCE * self.DIMENSO_VIEW_SCALE
 
     def _dimenso_wing_matrix(self, side):
         """Full TRS matrix for one wing, IN CAMERA SPACE, column-major.
@@ -342,32 +384,27 @@ class TeleVuer:
         yaw = -sign * math.radians(self.DIMENSO_WRIST_YAW_DEG)
         c, sn = math.cos(yaw), math.sin(yaw)
         x = sign * self.DIMENSO_WRIST_OFFSET_X
-        z = -self.DIMENSO_WRIST_DEPTH
+        # 2026-08-11: zoom applies to the DEPTH only, never to x or h -- scaling all three is an
+        # angle-preserving no-op. See DIMENSO_VIEW_SCALE.
+        z = -self.DIMENSO_WRIST_DEPTH * self.DIMENSO_VIEW_SCALE
         # column-major: [ Rx*w | Ry*h | Rz | T ]
         return [ c * w, 0.0, -sn * w, 0.0,
                    0.0,   h,     0.0, 0.0,
                     sn, 0.0,       c, 0.0,
                      x, 0.0,       z, 1.0]
 
-    def _dimenso_wrist_matrix(self, side):
-        """Column-major 4x4 placing one wing IN THE CAMERA'S OWN FRAME.
-
-        The component does `mesh.matrix.fromArray(matrix).premultiply(camera.matrixWorld)`, so a
-        matrix expressed in camera space rides with the head for free. World-space
-        position/rotation driven by `head_pose_shared` was tried first and sat still, because
-        that pose is only published by CAMERA_MOVE and does not arrive in this mode.
-        """
-        import math
-        sign = -1.0 if side == "left" else 1.0
-        yaw = -sign * math.radians(self.DIMENSO_WRIST_YAW_DEG)
-        c, sn = math.cos(yaw), math.sin(yaw)
-        x = sign * self.DIMENSO_WRIST_OFFSET_X
-        y = self.DIMENSO_WRIST_OFFSET_Y
-        z = -self.DIMENSO_WRIST_DISTANCE
-        return [  c, 0.0, -sn, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                 sn, 0.0,   c, 0.0,
-                  x,   y,   z, 1.0]
+    # `_dimenso_wrist_matrix` was DELETED here, deliberately, rather than left in place.
+    #
+    # It was the earlier placement helper, fully superseded by `_dimenso_wing_matrix` above
+    # (which bakes scale into the matrix). Nothing called it. It was also already BROKEN: its
+    # body read `self.DIMENSO_WRIST_OFFSET_Y`, which is not defined anywhere in this class, so
+    # the first call would have raised AttributeError -- and it would have been called from
+    # the panel path, on a live session, in the headset.
+    #
+    # Kept-but-dead was the wrong choice for it: two same-shaped matrix helpers side by side,
+    # one of them a landmine, is how the wrong one gets wired back in during a merge. The
+    # retained-on-purpose fallbacks in this project (walk_mode, policy.onnx) are retained
+    # because something still selects them; this had no such path.
 
     # The wrist cameras are mounted rotated relative to the operator's view, so the raw frame
     # reads sideways. 90 = clockwise, -90 = counter-clockwise, 180, or 0 to leave it alone.
@@ -462,44 +499,49 @@ class TeleVuer:
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
-        try:
-            # ControllerData
-            with self.left_arm_pose_shared.get_lock():
-                self.left_arm_pose_shared[:] = event.value["left"]
-            with self.right_arm_pose_shared.get_lock():
-                self.right_arm_pose_shared[:] = event.value["right"]
-            # ControllerState
-            left_controller = event.value["leftState"]
-            right_controller = event.value["rightState"]
+        # DIMENSO ADDITION (DIM-914): failure invalidation is atomic with writes.
+        with self.controller_diagnostics.lock:
+            try:
+                # ControllerData
+                with self.left_arm_pose_shared.get_lock():
+                    self.left_arm_pose_shared[:] = event.value["left"]
+                with self.right_arm_pose_shared.get_lock():
+                    self.right_arm_pose_shared[:] = event.value["right"]
+                # ControllerState
+                left_controller = event.value["leftState"]
+                right_controller = event.value["rightState"]
 
-            def extract_controllers(controllerState, prefix):
-                # trigger
-                with getattr(self, f"{prefix}_ctrl_trigger_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_trigger_shared").value = bool(controllerState.get("trigger", False))
-                with getattr(self, f"{prefix}_ctrl_triggerValue_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_triggerValue_shared").value = float(controllerState.get("triggerValue", 0.0))
-                # squeeze
-                with getattr(self, f"{prefix}_ctrl_squeeze_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_squeeze_shared").value = bool(controllerState.get("squeeze", False))
-                with getattr(self, f"{prefix}_ctrl_squeezeValue_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_squeezeValue_shared").value = float(controllerState.get("squeezeValue", 0.0))
-                # thumbstick
-                with getattr(self, f"{prefix}_ctrl_thumbstick_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_thumbstick_shared").value = bool(controllerState.get("thumbstick", False))
-                with getattr(self, f"{prefix}_ctrl_thumbstickValue_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_thumbstickValue_shared")[:] = controllerState.get("thumbstickValue", [0.0, 0.0])
-                # buttons
-                with getattr(self, f"{prefix}_ctrl_aButton_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_aButton_shared").value = bool(controllerState.get("aButton", False))
-                with getattr(self, f"{prefix}_ctrl_bButton_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_bButton_shared").value = bool(controllerState.get("bButton", False))
+                def extract_controllers(controllerState, prefix):
+                    # trigger
+                    with getattr(self, f"{prefix}_ctrl_trigger_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_trigger_shared").value = bool(controllerState.get("trigger", False))
+                    with getattr(self, f"{prefix}_ctrl_triggerValue_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_triggerValue_shared").value = float(controllerState.get("triggerValue", 0.0))
+                    # squeeze
+                    with getattr(self, f"{prefix}_ctrl_squeeze_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_squeeze_shared").value = bool(controllerState.get("squeeze", False))
+                    with getattr(self, f"{prefix}_ctrl_squeezeValue_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_squeezeValue_shared").value = float(controllerState.get("squeezeValue", 0.0))
+                    # thumbstick
+                    with getattr(self, f"{prefix}_ctrl_thumbstick_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_thumbstick_shared").value = bool(controllerState.get("thumbstick", False))
+                    with getattr(self, f"{prefix}_ctrl_thumbstickValue_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_thumbstickValue_shared")[:] = controllerState.get("thumbstickValue", [0.0, 0.0])
+                    # buttons
+                    with getattr(self, f"{prefix}_ctrl_aButton_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_aButton_shared").value = bool(controllerState.get("aButton", False))
+                    with getattr(self, f"{prefix}_ctrl_bButton_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_bButton_shared").value = bool(controllerState.get("bButton", False))
 
-            extract_controllers(left_controller, "left")
-            extract_controllers(right_controller, "right")
-            with self.motion_data_ready_shared.get_lock():
-                self.motion_data_ready_shared.value = True
-        except:
-            pass
+                extract_controllers(left_controller, "left")
+                extract_controllers(right_controller, "right")
+                self.controller_diagnostics.accept(event.value)
+                with self.motion_data_ready_shared.get_lock():
+                    self.motion_data_ready_shared.value = True
+            except:
+                # Existing decoding failed, possibly after some shared fields changed.
+                # Never pair those partial values with a previous receipt.
+                self.controller_diagnostics.invalidate()
 
     async def on_hand_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
@@ -579,7 +621,10 @@ class TeleVuer:
                         self.img2display[:, :self.img_width],
                         aspect=self.aspect_ratio,
                         height=self.DIMENSO_MAIN_HEIGHT,
-                        distanceToCamera=1,
+                        # 2026-08-11. `height`+`aspect` are correct HERE and would be a bug on the
+                        # wings: this is the upstream path and passes no `matrix`, so nothing
+                        # overwrites mesh.scale. The wings bake scale in instead.
+                        distanceToCamera=self._dimenso_main_distance,
                         # The underlying rendering engine supported a layer binary bitmask for both objects and the camera. 
                         # Below we set the two image planes, left and right, to layers=1 and layers=2. 
                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
@@ -593,7 +638,10 @@ class TeleVuer:
                         self.img2display[:, self.img_width:],
                         aspect=self.aspect_ratio,
                         height=self.DIMENSO_MAIN_HEIGHT,
-                        distanceToCamera=1,
+                        # 2026-08-11. `height`+`aspect` are correct HERE and would be a bug on the
+                        # wings: this is the upstream path and passes no `matrix`, so nothing
+                        # overwrites mesh.scale. The wings bake scale in instead.
+                        distanceToCamera=self._dimenso_main_distance,
                         layers=2,
                         format="jpeg",
                         quality=80,
@@ -635,7 +683,10 @@ class TeleVuer:
                         self.img2display,
                         aspect=self.aspect_ratio,
                         height=self.DIMENSO_MAIN_HEIGHT,
-                        distanceToCamera=1,
+                        # 2026-08-11. `height`+`aspect` are correct HERE and would be a bug on the
+                        # wings: this is the upstream path and passes no `matrix`, so nothing
+                        # overwrites mesh.scale. The wings bake scale in instead.
+                        distanceToCamera=self._dimenso_main_distance,
                         format="jpeg",
                         quality=80,
                         key="background-mono",

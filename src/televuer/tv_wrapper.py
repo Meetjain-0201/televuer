@@ -194,6 +194,7 @@ class TeleData:
     right_hand_squeeze: bool = False       # True if hand is making a fist
     right_hand_squeezeValue: float = 0.0   # (0.0 → 1.0) degree of hand squeeze
 
+    controller_diagnostics: dict = None  # DIMENSO ADDITION (DIM-914): receiver event provenance
     motion_data_ready: bool = False        # True after the first hand or controller motion data event is received
     # controller tracking
     # https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html
@@ -430,23 +431,31 @@ class TeleVuerWrapper:
             # "head_yaw" additionally left-multiplies R_Brobot_world_head_yaw^T, ignoring pitch/roll.
             left_IPunitree_Brobot_waist_arm = transform_IPunitree_Brobot_world_arm_to_head_then_waist(left_IPunitree_Brobot_world_arm, Brobot_world_head, self.arm_reference_mode)
             right_IPunitree_Brobot_waist_arm = transform_IPunitree_Brobot_world_arm_to_head_then_waist(right_IPunitree_Brobot_world_arm, Brobot_world_head, self.arm_reference_mode)
+            # DIMENSO ADDITION (DIM-914): sample the four existing control inputs
+            # with their event receipt atomically; retain the original mapping.
+            with self.tvuer.controller_diagnostics.lock:
+                controller_diagnostics = self.tvuer.controller_diagnostics.snapshot()
+                controller_values = {name: getattr(self.tvuer, name) for name in (
+                    "left_ctrl_triggerValue", "left_ctrl_squeezeValue",
+                    "right_ctrl_triggerValue", "right_ctrl_squeezeValue")}
             return TeleData(
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_waist_arm,
                 right_wrist_pose=right_IPunitree_Brobot_waist_arm,
+                controller_diagnostics=controller_diagnostics,
                 motion_data_ready=self.tvuer.motion_data_ready,
                 left_ctrl_trigger=self.tvuer.left_ctrl_trigger,
-                left_ctrl_triggerValue=10.0 - self.tvuer.left_ctrl_triggerValue * 10,
+                left_ctrl_triggerValue=10.0 - controller_values["left_ctrl_triggerValue"] * 10,
                 left_ctrl_squeeze=self.tvuer.left_ctrl_squeeze,
-                left_ctrl_squeezeValue=self.tvuer.left_ctrl_squeezeValue,
+                left_ctrl_squeezeValue=controller_values["left_ctrl_squeezeValue"],
                 left_ctrl_aButton=self.tvuer.left_ctrl_aButton,
                 left_ctrl_bButton=self.tvuer.left_ctrl_bButton,
                 left_ctrl_thumbstick=self.tvuer.left_ctrl_thumbstick,
                 left_ctrl_thumbstickValue=self.tvuer.left_ctrl_thumbstickValue,
                 right_ctrl_trigger=self.tvuer.right_ctrl_trigger,
-                right_ctrl_triggerValue=10.0 - self.tvuer.right_ctrl_triggerValue * 10,
+                right_ctrl_triggerValue=10.0 - controller_values["right_ctrl_triggerValue"] * 10,
                 right_ctrl_squeeze=self.tvuer.right_ctrl_squeeze,
-                right_ctrl_squeezeValue=self.tvuer.right_ctrl_squeezeValue,
+                right_ctrl_squeezeValue=controller_values["right_ctrl_squeezeValue"],
                 right_ctrl_aButton=self.tvuer.right_ctrl_aButton,
                 right_ctrl_bButton=self.tvuer.right_ctrl_bButton,
                 right_ctrl_thumbstick=self.tvuer.right_ctrl_thumbstick,
