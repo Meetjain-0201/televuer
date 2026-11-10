@@ -22,6 +22,8 @@ from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoP
 # world-space: the wings stopped following the head and ended up on the floor of the room.
 from vuer.schemas import ImageBackground as _DimensoImage
 from multiprocessing import Value, Array, Process, shared_memory
+# DIMENSO ADDITION (DIM-914): controller-only event provenance.
+from .controller_diagnostics import ControllerDiagnostics
 import numpy as np
 import asyncio
 import threading
@@ -110,6 +112,7 @@ class TeleVuer:
                     key_file = key_file or str(current_module_dir / "key.pem")
 
         self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        self.controller_diagnostics = ControllerDiagnostics()
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -496,44 +499,49 @@ class TeleVuer:
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
-        try:
-            # ControllerData
-            with self.left_arm_pose_shared.get_lock():
-                self.left_arm_pose_shared[:] = event.value["left"]
-            with self.right_arm_pose_shared.get_lock():
-                self.right_arm_pose_shared[:] = event.value["right"]
-            # ControllerState
-            left_controller = event.value["leftState"]
-            right_controller = event.value["rightState"]
+        # DIMENSO ADDITION (DIM-914): failure invalidation is atomic with writes.
+        with self.controller_diagnostics.lock:
+            try:
+                # ControllerData
+                with self.left_arm_pose_shared.get_lock():
+                    self.left_arm_pose_shared[:] = event.value["left"]
+                with self.right_arm_pose_shared.get_lock():
+                    self.right_arm_pose_shared[:] = event.value["right"]
+                # ControllerState
+                left_controller = event.value["leftState"]
+                right_controller = event.value["rightState"]
 
-            def extract_controllers(controllerState, prefix):
-                # trigger
-                with getattr(self, f"{prefix}_ctrl_trigger_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_trigger_shared").value = bool(controllerState.get("trigger", False))
-                with getattr(self, f"{prefix}_ctrl_triggerValue_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_triggerValue_shared").value = float(controllerState.get("triggerValue", 0.0))
-                # squeeze
-                with getattr(self, f"{prefix}_ctrl_squeeze_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_squeeze_shared").value = bool(controllerState.get("squeeze", False))
-                with getattr(self, f"{prefix}_ctrl_squeezeValue_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_squeezeValue_shared").value = float(controllerState.get("squeezeValue", 0.0))
-                # thumbstick
-                with getattr(self, f"{prefix}_ctrl_thumbstick_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_thumbstick_shared").value = bool(controllerState.get("thumbstick", False))
-                with getattr(self, f"{prefix}_ctrl_thumbstickValue_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_thumbstickValue_shared")[:] = controllerState.get("thumbstickValue", [0.0, 0.0])
-                # buttons
-                with getattr(self, f"{prefix}_ctrl_aButton_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_aButton_shared").value = bool(controllerState.get("aButton", False))
-                with getattr(self, f"{prefix}_ctrl_bButton_shared").get_lock():
-                    getattr(self, f"{prefix}_ctrl_bButton_shared").value = bool(controllerState.get("bButton", False))
+                def extract_controllers(controllerState, prefix):
+                    # trigger
+                    with getattr(self, f"{prefix}_ctrl_trigger_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_trigger_shared").value = bool(controllerState.get("trigger", False))
+                    with getattr(self, f"{prefix}_ctrl_triggerValue_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_triggerValue_shared").value = float(controllerState.get("triggerValue", 0.0))
+                    # squeeze
+                    with getattr(self, f"{prefix}_ctrl_squeeze_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_squeeze_shared").value = bool(controllerState.get("squeeze", False))
+                    with getattr(self, f"{prefix}_ctrl_squeezeValue_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_squeezeValue_shared").value = float(controllerState.get("squeezeValue", 0.0))
+                    # thumbstick
+                    with getattr(self, f"{prefix}_ctrl_thumbstick_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_thumbstick_shared").value = bool(controllerState.get("thumbstick", False))
+                    with getattr(self, f"{prefix}_ctrl_thumbstickValue_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_thumbstickValue_shared")[:] = controllerState.get("thumbstickValue", [0.0, 0.0])
+                    # buttons
+                    with getattr(self, f"{prefix}_ctrl_aButton_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_aButton_shared").value = bool(controllerState.get("aButton", False))
+                    with getattr(self, f"{prefix}_ctrl_bButton_shared").get_lock():
+                        getattr(self, f"{prefix}_ctrl_bButton_shared").value = bool(controllerState.get("bButton", False))
 
-            extract_controllers(left_controller, "left")
-            extract_controllers(right_controller, "right")
-            with self.motion_data_ready_shared.get_lock():
-                self.motion_data_ready_shared.value = True
-        except:
-            pass
+                extract_controllers(left_controller, "left")
+                extract_controllers(right_controller, "right")
+                self.controller_diagnostics.accept(event.value)
+                with self.motion_data_ready_shared.get_lock():
+                    self.motion_data_ready_shared.value = True
+            except:
+                # Existing decoding failed, possibly after some shared fields changed.
+                # Never pair those partial values with a previous receipt.
+                self.controller_diagnostics.invalidate()
 
     async def on_hand_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
