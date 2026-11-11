@@ -1,5 +1,5 @@
 from vuer import Vuer
-from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+from vuer.schemas import PerspectiveCamera, ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
 # DIMENSO ADDITION: free-floating panels for the wrist cameras (DIM-547).
 # ImageBackground, not Image: Image serialises the array as RAW `rgb` (~920KB per
 # 640x480 frame, per panel, per tick), while ImageBackground compresses to `src`
@@ -160,7 +160,12 @@ class TeleVuer:
         else:
             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
         
-        self.vuer.spawn(start=False)(fn)
+        async def session_handler(session):
+            # Camera-only repair: auxiliary previews overwrite the immersive framebuffer.
+            session.update @ PerspectiveCamera(
+                key="perspective-camera", previewInScene=False, previewInOverlay=False)
+            await fn(session)
+        self.vuer.spawn(start=False)(session_handler)
 
         self.head_pose_shared = Array('d', 16, lock=True)
         self.left_arm_pose_shared = Array('d', 16, lock=True)
